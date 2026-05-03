@@ -1,0 +1,45 @@
+# Local environments and caches
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+hf_cache/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Datasets and private exports
+data/
+Data/
+JPEGImages/
+SegmentationClass/
+SegmentationObject/
+ImageSets/
+*.zip
+*.kml
+*.kmz
+*.ipynb
+
+# Training/runtime outputs
+runs/
+outputs/
+*.onnx
+*.engine
+*.plan
+
+# Hugging Face Trainer checkpoints and optimizer state
+models/**/checkpoint-*/
+models/**/optimizer.pt
+models/**/scheduler.pt
+models/**/rng_state.pth
+models/**/trainer_state.json
+models/**/training_args.bin
+
