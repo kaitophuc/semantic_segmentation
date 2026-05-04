@@ -62,8 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-ratio",
         type=float,
-        default=0.2,
-        help="Validation split ratio, between 0 and 1.",
+        default=0.0,
+        help="Optional validation split ratio, between 0 and 1. Defaults to train-only.",
     )
     parser.add_argument(
         "--seed",
@@ -107,8 +107,9 @@ def make_split(ids: list[str], val_ratio: float, seed: int) -> tuple[set[str], s
     return train_ids, val_ids
 
 
-def ensure_output_dirs(output_root: Path) -> None:
-    for subset in ("train", "val"):
+def ensure_output_dirs(output_root: Path, include_val: bool) -> None:
+    subsets = ("train", "val") if include_val else ("train",)
+    for subset in subsets:
         (output_root / "images" / subset).mkdir(parents=True, exist_ok=True)
         (output_root / "masks" / subset).mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +169,7 @@ def main() -> int:
         return 1
 
     train_ids, val_ids = make_split(image_ids, args.val_ratio, args.seed)
-    ensure_output_dirs(output_root)
+    ensure_output_dirs(output_root, include_val=bool(val_ids))
 
     mapping_path = output_root / "mapping.csv"
     train_stems: list[str] = []
@@ -221,11 +222,13 @@ def main() -> int:
             copied += 1
 
     write_list(output_root / "train.txt", train_stems)
-    write_list(output_root / "val.txt", val_stems)
+    if val_stems:
+        write_list(output_root / "val.txt", val_stems)
 
     print(f"Done. Converted {copied} image/mask pairs.")
     print(f"Train: {len(train_stems)}")
-    print(f"Val: {len(val_stems)}")
+    if val_stems:
+        print(f"Val: {len(val_stems)}")
     print(f"Output: {output_root}")
     print(f"Mapping: {mapping_path}")
     return 0
@@ -233,4 +236,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

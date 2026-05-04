@@ -88,11 +88,8 @@ Expected output:
 ```text
 data/segformer_dataset/
   images/train/*.jpg
-  images/val/*.jpg
   masks/train/*.png
-  masks/val/*.png
   train.txt
-  val.txt
   mapping.csv
 ```
 
@@ -106,7 +103,7 @@ Run a full training job:
 python train.py \
   --data-root data/segformer_dataset \
   --output-dir models/segformer-drivable \
-  --batch-size 1 \
+  --batch-size 2 \
   --epochs 30
 ```
 
@@ -116,6 +113,8 @@ Meaning of the main options:
 - `--image-size`: training input size. The default is `1920 1080`.
 - `--batch-size`: lower this if CUDA runs out of memory.
 - `--epochs`: number of training passes through the dataset.
+
+Training uses every sample in `train.txt`; no validation split is required by default.
 
 For a quick smoke test:
 
@@ -227,4 +226,4 @@ TensorRT missing:
 
 Image/mask path mismatch:
 
-- Confirm every ID in `train.txt` and `val.txt` has a matching `.jpg` in `images/<split>/` and `.png` in `masks/<split>/`.
+- Confirm every ID in `train.txt` has a matching `.jpg` in `images/train/` and `.png` in `masks/train/`.

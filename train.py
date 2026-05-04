@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import (
     AutoImageProcessor,
+    AutoConfig,
     SegformerForSemanticSegmentation,
     Trainer,
     TrainingArguments,
@@ -30,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         default="data/segformer_dataset",
-        help="Prepared dataset root containing images, masks, train.txt, and val.txt.",
+        help="Prepared dataset root containing images/train, masks/train, and train.txt.",
     )
     parser.add_argument(
         "--model-name",
@@ -56,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
-        help="Per-device train/eval batch size.",
+        default=2,
+        help="Per-device train batch size.",
     )
     parser.add_argument(
         "--epochs",
@@ -80,8 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logging-steps",
         type=int,
-        default=10,
-        help="Trainer logging interval.",
+        default=None,
+        help="Optional exact Trainer logging step interval.",
+    )
+    parser.add_argument(
+        "--logging-epochs",
+        type=float,
+        default=2.0,
+        help="Trainer logging interval in epochs.",
     )
     parser.add_argument(
         "--save-total-limit",
@@ -152,49 +160,32 @@ class DrivableDataset(Dataset):
         }
 
 
-def compute_metrics(eval_pred) -> dict[str, float]:
-    logits, labels = eval_pred
-    logits_tensor = torch.as_tensor(logits)
-    labels_tensor = torch.as_tensor(labels)
+def compute_logging_steps(dataset_size: int, args: argparse.Namespace) -> int:
+    if args.logging_steps is not None:
+        return max(1, args.logging_steps)
 
-    logits_tensor = torch.nn.functional.interpolate(
-        logits_tensor,
-        size=labels_tensor.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    )
-    predictions = logits_tensor.argmax(dim=1)
-
-    pixel_accuracy = (predictions == labels_tensor).float().mean().item()
-
-    pred_drivable = predictions == LABEL2ID["drivable"]
-    label_drivable = labels_tensor == LABEL2ID["drivable"]
-    intersection = torch.logical_and(pred_drivable, label_drivable).sum().item()
-    union = torch.logical_or(pred_drivable, label_drivable).sum().item()
-    drivable_iou = intersection / union if union > 0 else 0.0
-
-    return {
-        "pixel_accuracy": pixel_accuracy,
-        "drivable_iou": drivable_iou,
-    }
+    steps_per_epoch = math.ceil(dataset_size / args.batch_size)
+    return max(1, round(steps_per_epoch * args.logging_epochs))
 
 
-def make_training_arguments(args: argparse.Namespace) -> TrainingArguments:
+def make_training_arguments(
+    args: argparse.Namespace,
+    train_dataset: DrivableDataset,
+) -> TrainingArguments:
     kwargs = {
         "output_dir": args.output_dir,
         "learning_rate": args.learning_rate,
         "num_train_epochs": args.epochs,
         "max_steps": args.max_steps,
         "per_device_train_batch_size": args.batch_size,
-        "per_device_eval_batch_size": args.batch_size,
-        "eval_strategy": "epoch",
+        "eval_strategy": "no",
         "save_strategy": "epoch",
-        "logging_steps": args.logging_steps,
+        "logging_strategy": "steps",
+        "logging_steps": compute_logging_steps(len(train_dataset), args),
+        "disable_tqdm": True,
+        "report_to": "none",
         "save_total_limit": args.save_total_limit,
         "remove_unused_columns": False,
-        "load_best_model_at_end": True,
-        "metric_for_best_model": "drivable_iou",
-        "greater_is_better": True,
     }
     try:
         return TrainingArguments(**kwargs)
@@ -234,22 +225,22 @@ def main() -> int:
 
     image_processor = build_image_processor(args.model_name, image_size)
     train_dataset = DrivableDataset(data_root, "train", image_processor, image_size)
-    val_dataset = DrivableDataset(data_root, "val", image_processor, image_size)
+
+    config = AutoConfig.from_pretrained(args.model_name)
+    config.num_labels = len(ID2LABEL)
+    config.id2label = ID2LABEL
+    config.label2id = LABEL2ID
 
     model = SegformerForSemanticSegmentation.from_pretrained(
         args.model_name,
-        num_labels=len(ID2LABEL),
-        id2label=ID2LABEL,
-        label2id=LABEL2ID,
+        config=config,
         ignore_mismatched_sizes=True,
     )
 
     trainer = Trainer(
         model=model,
-        args=make_training_arguments(args),
+        args=make_training_arguments(args, train_dataset),
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
