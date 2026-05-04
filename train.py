@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
 
 import cv2 as cv
@@ -19,6 +20,7 @@ from transformers import (
 
 ID2LABEL = {0: "background", 1: "drivable"}
 LABEL2ID = {"background": 0, "drivable": 1}
+DEFAULT_IMAGE_SIZE = (1920, 1080)
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,8 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-size",
         type=int,
-        default=1024,
-        help="Square training size in pixels.",
+        nargs="+",
+        default=DEFAULT_IMAGE_SIZE,
+        metavar=("WIDTH", "HEIGHT"),
+        help=(
+            "Training size. Pass one value for square input or WIDTH HEIGHT. "
+            "Defaults to 1920 1080."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -96,12 +103,12 @@ class DrivableDataset(Dataset):
         root: Path,
         split: str,
         image_processor,
-        image_size: int,
+        image_size: tuple[int, int],
     ) -> None:
         self.root = root
         self.split = split
         self.image_processor = image_processor
-        self.image_size = image_size
+        self.image_height, self.image_width = image_size
         self.image_ids = read_split(root / f"{split}.txt")
         self.image_dir = root / "images" / split
         self.mask_dir = root / "masks" / split
@@ -125,12 +132,12 @@ class DrivableDataset(Dataset):
 
         image = cv.resize(
             image,
-            (self.image_size, self.image_size),
+            (self.image_width, self.image_height),
             interpolation=cv.INTER_LINEAR,
         )
         mask = cv.resize(
             mask,
-            (self.image_size, self.image_size),
+            (self.image_width, self.image_height),
             interpolation=cv.INTER_NEAREST,
         )
 
@@ -198,13 +205,24 @@ def make_training_arguments(args: argparse.Namespace) -> TrainingArguments:
         return TrainingArguments(**kwargs)
 
 
-def build_image_processor(model_name: str, image_size: int):
+def read_image_size(override: Sequence[int]) -> tuple[int, int]:
+    if len(override) == 1:
+        size = int(override[0])
+        return size, size
+    if len(override) == 2:
+        width, height = override
+        return int(height), int(width)
+    raise ValueError("--image-size expects one value or WIDTH HEIGHT.")
+
+
+def build_image_processor(model_name: str, image_size: tuple[int, int]):
+    height, width = image_size
     image_processor = AutoImageProcessor.from_pretrained(
         model_name,
         do_reduce_labels=False,
         do_resize=False,
     )
-    image_processor.size = {"height": image_size, "width": image_size}
+    image_processor.size = {"height": height, "width": width}
     image_processor.do_resize = False
     return image_processor
 
@@ -212,10 +230,11 @@ def build_image_processor(model_name: str, image_size: int):
 def main() -> int:
     args = parse_args()
     data_root = Path(args.data_root)
+    image_size = read_image_size(args.image_size)
 
-    image_processor = build_image_processor(args.model_name, args.image_size)
-    train_dataset = DrivableDataset(data_root, "train", image_processor, args.image_size)
-    val_dataset = DrivableDataset(data_root, "val", image_processor, args.image_size)
+    image_processor = build_image_processor(args.model_name, image_size)
+    train_dataset = DrivableDataset(data_root, "train", image_processor, image_size)
+    val_dataset = DrivableDataset(data_root, "val", image_processor, image_size)
 
     model = SegformerForSemanticSegmentation.from_pretrained(
         args.model_name,
@@ -240,4 +259,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

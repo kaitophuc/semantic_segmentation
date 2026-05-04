@@ -1,5 +1,12 @@
-torch
-torchvision
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# CUDA 12.6 PyTorch wheels.
+torch==2.11.0+cu126
+torchvision==0.26.0+cu126
+cuda-toolkit==12.6.3; platform_system == "Linux"
+
+# On Jetson/Tegra, install TensorRT from JetPack/apt instead of pip:
+# sudo apt install tensorrt python3-libnvinfer libnvinfer-bin
 transformers
 accelerate
 opencv-python
@@ -7,4 +14,4 @@ numpy
 safetensors
 pillow
 tqdm
-
+onnx

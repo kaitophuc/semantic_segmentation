@@ -106,7 +106,6 @@ Run a full training job:
 python train.py \
   --data-root data/segformer_dataset \
   --output-dir models/segformer-drivable \
-  --image-size 1024 \
   --batch-size 1 \
   --epochs 30
 ```
@@ -114,7 +113,7 @@ python train.py \
 Meaning of the main options:
 
 - `--data-root`: prepared dataset root.
-- `--image-size`: square training and inference size. `1024` preserves more road-edge detail than smaller sizes.
+- `--image-size`: training input size. The default is `1920 1080`.
 - `--batch-size`: lower this if CUDA runs out of memory.
 - `--epochs`: number of training passes through the dataset.
 
@@ -136,11 +135,12 @@ python train.py \
 
 ## Inference
 
-Run PyTorch inference with the included model:
+Run TensorRT inference with the full-HD engine:
 
 ```bash
 python inference.py \
   --image path/to/image.jpg \
+  --engine models/segformer-drivable/segformer_drivable_1920x1080_fp16.engine \
   --model-dir models/segformer-drivable \
   --output-mask outputs/mask.png \
   --overlay outputs/overlay.jpg
@@ -162,6 +162,7 @@ Clone the repository on the target machine, install dependencies, and run:
 ```bash
 python inference.py \
   --image path/to/image.jpg \
+  --engine models/segformer-drivable/segformer_drivable_1920x1080_fp16.engine \
   --model-dir models/segformer-drivable \
   --output-mask outputs/mask.png
 ```
@@ -175,17 +176,15 @@ Export ONNX:
 ```bash
 python -m pip install onnx
 python export_onnx.py \
-  --model-dir models/segformer-drivable \
-  --output models/segformer-drivable/segformer_drivable_1024.onnx \
-  --image-size 1024
+  --model-dir models/segformer-drivable
 ```
 
 Copy the ONNX model to the deployment machine and build the TensorRT engine there:
 
 ```bash
 trtexec \
-  --onnx=models/segformer-drivable/segformer_drivable_1024.onnx \
-  --saveEngine=models/segformer-drivable/segformer_drivable_1024_fp16.engine \
+  --onnx=models/segformer-drivable/segformer_drivable_1920x1080.onnx \
+  --saveEngine=models/segformer-drivable/segformer_drivable_1920x1080_fp16.engine \
   --fp16
 ```
 
@@ -208,7 +207,7 @@ Only the final model weights and reusable code are meant to be public.
 CUDA out of memory:
 
 - Use `--batch-size 1`.
-- Try a smaller `--image-size`, such as `768`.
+- Use a smaller `--image-size` only when intentionally running a reduced-size test.
 
 Wrong mask values:
 
