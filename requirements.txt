@@ -1,12 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cu126
-
-# CUDA 12.6 PyTorch wheels.
-torch==2.11.0+cu126
-torchvision==0.26.0+cu126
-cuda-toolkit==12.6.3; platform_system == "Linux"
-
-# On Jetson/Tegra, install TensorRT from JetPack/apt instead of pip:
-# sudo apt install tensorrt python3-libnvinfer libnvinfer-bin
+# Project Python dependencies that are safe to install after the Jetson-specific
+# PyTorch/TensorRT setup has been completed.
+#
+# Do not pin generic PyPI PyTorch CUDA wheels here. Jetson Orin/Nano devices
+# need NVIDIA Jetson-compatible PyTorch builds, installed by
+# setup_jetson_nano_orin.sh.
 transformers
 accelerate
 opencv-python
@@ -15,3 +12,7 @@ safetensors
 pillow
 tqdm
 onnx
+
+# Required by current Jetson PyTorch wheels. The setup script also adds its
+# library folder to LD_LIBRARY_PATH when the venv is activated.
+nvidia-cudss-cu12
