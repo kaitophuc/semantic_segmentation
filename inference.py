@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
@@ -167,6 +168,18 @@ def preprocess_frame(frame_bgr: np.ndarray, input_size: tuple[int, int]) -> np.n
     return np.ascontiguousarray(frame_batched, dtype=np.float32)
 
 
+@dataclass
+class AsyncInferenceSlot:
+    context: trt.IExecutionContext
+    stream: torch.cuda.Stream
+    done_event: torch.cuda.Event
+    host_input: torch.Tensor
+    device_input: torch.Tensor
+    device_output: torch.Tensor
+    host_output: torch.Tensor
+    frame_bgr: np.ndarray | None = None
+    busy: bool = False
+
 class TensorRTRunner:
     def __init__(self, engine: trt.ICudaEngine) -> None:
         self.engine = engine
@@ -175,19 +188,97 @@ class TensorRTRunner:
         self.input_dtype = torch_dtype_from_trt(engine.get_tensor_dtype(self.input_name))
         self.output_dtype = torch_dtype_from_trt(engine.get_tensor_dtype(self.output_name))
 
-    def infer(self, input_array: np.ndarray) -> np.ndarray:
-        input_tensor = torch.from_numpy(input_array).to("cuda").to(self.input_dtype)
-        input_shape = tuple(input_tensor.shape)
+    def _configure_context(self, context: trt.IExecutionContext, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         engine_input_shape = tuple(self.engine.get_tensor_shape(self.input_name))
-
         if -1 in engine_input_shape:
-            self.context.set_input_shape(self.input_name, input_shape)
+            context.set_input_shape(self.input_name, input_shape)
         elif input_shape != engine_input_shape:
             raise ValueError(
                 f"Input shape {input_shape} does not match engine shape {engine_input_shape}"
             )
+        
+        output_shape = tuple(context.get_tensor_shape(self.output_name))
+        if any(dim < 0 for dim in output_shape):
+            raise RuntimeError(f"TensorRT output shape is still dynamic: {output_shape}")
+        return output_shape
+    
+    def create_async_slots(self, input_shape: tuple[int, ...], slot_count: int = 2) -> list[AsyncInferenceSlot]:
 
-        output_shape = tuple(self.context.get_tensor_shape(self.output_name))
+        slots = []
+        for _ in range(slot_count):
+            context = self.engine.create_execution_context()
+            output_shape = self._configure_context(context, input_shape)
+
+            host_input = torch.empty(input_shape, dtype=self.input_dtype, device="cpu", pin_memory=True)
+            device_input = torch.empty(input_shape, dtype=self.input_dtype, device="cuda")
+            device_output = torch.empty(output_shape, dtype=self.output_dtype, device="cuda")
+            host_output = torch.empty(output_shape, dtype=self.output_dtype, device="cpu", pin_memory=True)
+
+            slots.append(
+                AsyncInferenceSlot(
+                    context=context,
+                    stream=torch.cuda.Stream(),
+                    done_event=torch.cuda.Event(blocking=False),
+                    host_input=host_input,
+                    device_input=device_input,
+                    device_output=device_output,
+                    host_output=host_output,
+                )
+            )
+
+        return slots
+    
+    def enqueue_async(self, slot: AsyncInferenceSlot, input_array: np.ndarray, frame_bgr: np.ndarray,) -> None:
+        if slot.busy:
+            raise RuntimeError("Tried to enqueue into a busy async inference slot.")
+        
+        input_shape = tuple(input_array.shape)
+        if input_shape != tuple(slot.host_input.shape):
+            raise ValueError(
+                f"Input shape {input_shape} does not match slot shape "
+                f"{tuple(slot.host_input.shape)}"
+            )
+        
+        slot.host_input.copy_(torch.from_numpy(input_array))
+        slot.frame_bgr = frame_bgr
+
+        with torch.cuda.stream(slot.stream):
+            slot.device_input.copy_(slot.host_input, non_blocking=True)
+
+            slot.context.set_tensor_address(self.input_name, slot.device_input.data_ptr())
+            slot.context.set_tensor_address(self.output_name, slot.device_output.data_ptr())
+
+            ok = slot.context.execute_async_v3(stream_handle=slot.stream.cuda_stream)
+            if not ok:
+                raise RuntimeError("Failed to execute TensorRT engine.")
+            
+            slot.host_output.copy_(slot.device_output, non_blocking=True)
+            slot.done_event.record(slot.stream)
+
+        slot.busy = True
+
+    def finish_async(self, slot: AsyncInferenceSlot) -> tuple[np.ndarray, np.ndarray]:
+        if not slot.busy:
+            raise RuntimeError("Tried to finish an idle async inference slot.")
+        
+        slot.done_event.synchronize()
+
+        if slot.frame_bgr is None:
+            raise RuntimeError("Async slot finished without an attached frame.")
+        
+        frame_bgr = slot.frame_bgr
+        logits = slot.host_output.numpy()
+
+        slot.frame_bgr = None
+        slot.busy = False
+
+        return frame_bgr, logits
+    
+    def infer(self, input_array: np.ndarray) -> np.ndarray:
+        input_tensor = torch.from_numpy(input_array).to("cuda").to(self.input_dtype)
+        input_shape = tuple(input_tensor.shape)
+        output_shape = self._configure_context(self.context, input_shape)
+
         output_tensor = torch.empty(output_shape, dtype=self.output_dtype, device="cuda")
 
         self.context.set_tensor_address(self.input_name, input_tensor.data_ptr())
@@ -197,9 +288,9 @@ class TensorRTRunner:
         ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
         if not ok:
             raise RuntimeError("Failed to execute TensorRT engine.")
-
+        
         stream.synchronize()
-        return output_tensor.detach().cpu().float().numpy()
+        return output_tensor.detach().cpu().float.numpy()
 
 
 def postprocess(logits: np.ndarray, original_size: tuple[int, int]) -> np.ndarray:
@@ -267,26 +358,51 @@ def run_video(
     if not writer.isOpened():
         raise RuntimeError(f"Could not open output video writer: {output_path}")
 
-    frame_index = 0
+    input_h, input_w = input_size
+    input_shape = (1, 3, input_h, input_w)
+    slots = runner.create_async_slots(input_shape=input_shape, slot_count=2)
+
+    scheduled_frames = 0
+    completed_frames = 0
+    next_slot_index = 0
+
+    def finish_and_write(slot: AsyncInferenceSlot) -> None:
+        nonlocal completed_frames
+
+        frame, logits = runner.finish_async(slot)
+        mask = postprocess(logits, frame.shape[:2])
+        writer.write(make_overlay(frame, mask, alpha))
+
+        completed_frames += 1
+        if completed_frames % 30 == 0:
+            print(f"Processed {completed_frames}/{total_frames or '?'} frames")
+
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
 
-            logits = runner.infer(preprocess_frame(frame, input_size))
-            mask = postprocess(logits, frame.shape[:2])
-            writer.write(make_overlay(frame, mask, alpha))
+            slot = slots[next_slot_index]
 
-            frame_index += 1
-            if frame_index % 30 == 0:
-                print(f"Processed {frame_index}/{total_frames or '?'} frames")
+            if slot.busy:
+                finish_and_write(slot)
+
+            input_array = preprocess_frame(frame, input_size)
+            runner.enqueue_async(slot, input_array, frame)
+
+            scheduled_frames += 1
+            next_slot_index = (next_slot_index + 1) % len(slots)
+        
+        for slot in slots:
+            if slot.busy:
+                finish_and_write(slot)
+
     finally:
         capture.release()
         writer.release()
 
     print(f"Wrote overlay video: {output_path}")
-
 
 def main() -> int:
     args = parse_args()
