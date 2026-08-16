@@ -8,6 +8,7 @@ transformers
 accelerate
 opencv-python
 numpy
+scipy>=1.15
 safetensors
 pillow
 tqdm

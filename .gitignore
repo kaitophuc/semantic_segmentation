@@ -34,6 +34,8 @@ outputs/
 *.onnx
 *.engine
 *.plan
+*.so
+*.timing.cache*
 
 # Hugging Face Trainer checkpoints and optimizer state
 models/**/checkpoint-*/
@@ -42,4 +44,3 @@ models/**/scheduler.pt
 models/**/rng_state.pth
 models/**/trainer_state.json
 models/**/training_args.bin
-

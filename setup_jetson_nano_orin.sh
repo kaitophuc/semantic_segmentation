@@ -56,6 +56,15 @@ echo
 echo "Installing project dependencies..."
 python -m pip install -r requirements.txt
 
+echo
+echo "Installing GStreamer elements for Jetson hardware video decode..."
+sudo apt-get install -y gstreamer1.0-plugins-bad gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly
+
+echo
+echo "Building fused CUDA preprocessing and overlay kernels..."
+"${PROJECT_DIR}/build_cuda_kernels.sh"
+
 if ! grep -Fq "${CUDSS_LIB_LINE}" "${VENV_DIR}/bin/activate"; then
     echo
     echo "Adding cuDSS library path to venv activation..."

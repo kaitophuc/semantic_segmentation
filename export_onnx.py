@@ -59,6 +59,17 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
         help="Device to use during export. Defaults to auto with CPU fallback.",
     )
+    parser.add_argument(
+        "--first-patch-stride",
+        type=int,
+        default=None,
+        help=(
+            "Optional stride for the first SegFormer patch embedding. "
+            "The trained/default architecture uses 4. A larger value keeps "
+            "the full-resolution engine input but reduces the token grid and "
+            "therefore changes the model's accuracy/performance tradeoff."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -132,6 +143,14 @@ def export_onnx(args: argparse.Namespace) -> None:
 
     model = SegformerForSemanticSegmentation.from_pretrained(model_dir)
     model.eval()
+    if args.first_patch_stride is not None:
+        if args.first_patch_stride <= 0:
+            raise ValueError("--first-patch-stride must be positive.")
+        first_projection = model.segformer.encoder.patch_embeddings[0].proj
+        first_projection.stride = (
+            args.first_patch_stride,
+            args.first_patch_stride,
+        )
     model.to(device)
 
     wrapped_model = SegformerLogitsWrapper(model)
@@ -157,6 +176,8 @@ def export_onnx(args: argparse.Namespace) -> None:
 
     print(f"ONNX model exported successfully to {output_path}")
     print(f"Model input shape: (1, 3, {height}, {width})")
+    if args.first_patch_stride is not None:
+        print(f"First patch embedding stride: {args.first_patch_stride}")
 
 
 def check_onnx(output_path: Path) -> None:
