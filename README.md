@@ -134,6 +134,29 @@ python train.py \
 
 ## Inference
 
+Run TensorRT inference on a video and write the segmentation overlay:
+
+```bash
+python inference.py \
+  --video Data/input/IMG_3767.MOV \
+  --engine models/segformer-drivable/segformer_drivable_1920x1080_fp16.engine \
+  --model-dir models/segformer-drivable \
+  --output-video Data/output/IMG_3767_overlay.mp4
+```
+
+The program reports cumulative processing throughput every 30 completed frames
+and prints a final summary:
+
+```text
+Processed 30/3749 frames | elapsed 1.25 s | 24.00 FPS
+Video processing complete: 3749 frames in 130.00 seconds (28.84 FPS). Output: Data/output/IMG_3767_overlay.mp4
+```
+
+Processing FPS measures the complete video pipeline: frame decoding,
+preprocessing, TensorRT execution, mask and overlay generation, and output video
+encoding. It starts only after the model, video streams, TensorRT contexts, and
+GPU buffers are initialized, so model loading and other setup work are excluded.
+
 Run TensorRT inference with the full-HD engine:
 
 ```bash

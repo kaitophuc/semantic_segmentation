@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
+import time
 
 SYSTEM_TENSORRT_PATH = Path("/usr/lib/python3.10/dist-packages")
 if SYSTEM_TENSORRT_PATH.exists() and str(SYSTEM_TENSORRT_PATH) not in sys.path:
@@ -391,9 +392,9 @@ def run_video(
     if not capture.isOpened():
         raise FileNotFoundError(f"Video not found or could not be opened: {video_path}")
 
-    fps = capture.get(cv.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
+    source_fps = capture.get(cv.CAP_PROP_FPS)
+    if source_fps <= 0:
+        source_fps = 30.0
 
     frame_w = int(capture.get(cv.CAP_PROP_FRAME_WIDTH))
     frame_h = int(capture.get(cv.CAP_PROP_FRAME_HEIGHT))
@@ -401,7 +402,12 @@ def run_video(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    writer = cv.VideoWriter(str(output_path), fourcc, fps, (frame_w, frame_h))
+    writer = cv.VideoWriter(
+        str(output_path),
+        fourcc,
+        source_fps,
+        (frame_w, frame_h),
+    )
     if not writer.isOpened():
         raise RuntimeError(f"Could not open output video writer: {output_path}")
 
@@ -409,9 +415,9 @@ def run_video(
     input_shape = (1, 3, input_h, input_w)
     slots = runner.create_async_slots(input_shape=input_shape, slot_count=2)
 
-    scheduled_frames = 0
     completed_frames = 0
     next_slot_index = 0
+    total_frames_display: int | str = total_frames if total_frames > 0 else "?"
 
     def finish_and_write(slot: AsyncInferenceSlot) -> None:
         nonlocal completed_frames
@@ -422,8 +428,18 @@ def run_video(
 
         completed_frames += 1
         if completed_frames % 30 == 0:
-            print(f"Processed {completed_frames}/{total_frames or '?'} frames")
+            processing_elapsed = time.perf_counter() - processing_started_at
+            processing_fps = (
+                completed_frames / processing_elapsed
+                if processing_elapsed > 0.0
+                else 0.0
+            )
+            print(
+                f"Processed {completed_frames}/{total_frames_display} frames | "
+                f"elapsed {processing_elapsed:.2f} s | {processing_fps:.2f} FPS"
+            )
 
+    processing_started_at = time.perf_counter()
     try:
         while True:
             ok, frame = capture.read()
@@ -438,7 +454,6 @@ def run_video(
             preprocess_frame(frame, input_size, output=slot.host_input_array)
             runner.enqueue_async(slot, frame)
 
-            scheduled_frames += 1
             next_slot_index = (next_slot_index + 1) % len(slots)
         
         for slot in slots:
@@ -449,7 +464,15 @@ def run_video(
         capture.release()
         writer.release()
 
-    print(f"Wrote overlay video: {output_path}")
+    processing_elapsed = time.perf_counter() - processing_started_at
+    average_processing_fps = (
+        completed_frames / processing_elapsed if processing_elapsed > 0.0 else 0.0
+    )
+    print(
+        "Video processing complete: "
+        f"{completed_frames} frames in {processing_elapsed:.2f} seconds "
+        f"({average_processing_fps:.2f} FPS). Output: {output_path}"
+    )
 
 def main() -> int:
     args = parse_args()
