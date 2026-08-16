@@ -24,6 +24,15 @@ import torch
 LOGGER = trt.Logger(trt.Logger.WARNING)
 DEFAULT_INPUT_VIDEO = Path("Data/input/IMG_3767.MOV")
 DEFAULT_OUTPUT_VIDEO = Path("Data/output/IMG_3767_overlay.mp4")
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+INPUT_SCALE = (1.0 / (255.0 * IMAGENET_STD)).astype(np.float32)
+INPUT_BIAS = (-IMAGENET_MEAN / IMAGENET_STD).astype(np.float32)
+BGR_TO_RGB_CHANNELS = (2, 1, 0)
+PIXEL_VALUES = np.arange(256, dtype=np.float32)[:, None]
+INPUT_LOOKUP_FLOAT16 = (
+    (PIXEL_VALUES / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+).T.astype(np.float16)
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,19 +162,60 @@ def choose_input_size(
     return read_processor_size(model_dir)
 
 
-def preprocess_frame(frame_bgr: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
+def preprocess_frame(
+    frame_bgr: np.ndarray,
+    input_size: tuple[int, int],
+    *,
+    output: np.ndarray | None = None,
+) -> np.ndarray:
     input_h, input_w = input_size
-    frame_rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
-    frame_resized = cv.resize(frame_rgb, (input_w, input_h), interpolation=cv.INTER_LINEAR)
+    expected_shape = (1, 3, input_h, input_w)
 
-    frame_normalized = frame_resized.astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    frame_normalized = (frame_normalized - mean) / std
+    if output is None:
+        output = np.empty(expected_shape, dtype=np.float32)
+    elif output.shape != expected_shape:
+        raise ValueError(
+            f"Preprocessing output shape {output.shape} does not match {expected_shape}"
+        )
+    elif output.dtype not in (np.float16, np.float32):
+        raise ValueError(
+            "Preprocessing output must use float16 or float32, "
+            f"found {output.dtype}"
+        )
 
-    frame_transposed = np.transpose(frame_normalized, (2, 0, 1))
-    frame_batched = np.expand_dims(frame_transposed, axis=0)
-    return np.ascontiguousarray(frame_batched, dtype=np.float32)
+    if frame_bgr.shape[:2] == (input_h, input_w):
+        frame_resized = frame_bgr
+    else:
+        frame_resized = cv.resize(
+            frame_bgr,
+            (input_w, input_h),
+            interpolation=cv.INTER_LINEAR,
+        )
+
+    if output.dtype == np.float16:
+        # Match the legacy float32-normalize-then-cast behavior for FP16 bindings.
+        for output_channel, input_channel in enumerate(BGR_TO_RGB_CHANNELS):
+            np.take(
+                INPUT_LOOKUP_FLOAT16[output_channel],
+                frame_resized[:, :, input_channel],
+                out=output[0, output_channel],
+            )
+    else:
+        # Write BGR source channels directly into normalized RGB CHW planes.
+        for output_channel, input_channel in enumerate(BGR_TO_RGB_CHANNELS):
+            channel_output = output[0, output_channel]
+            np.multiply(
+                frame_resized[:, :, input_channel],
+                INPUT_SCALE[output_channel],
+                out=channel_output,
+            )
+            np.add(
+                channel_output,
+                INPUT_BIAS[output_channel],
+                out=channel_output,
+            )
+
+    return output
 
 
 @dataclass
@@ -174,6 +224,7 @@ class AsyncInferenceSlot:
     stream: torch.cuda.Stream
     done_event: torch.cuda.Event
     host_input: torch.Tensor
+    host_input_array: np.ndarray
     device_input: torch.Tensor
     device_output: torch.Tensor
     host_output: torch.Tensor
@@ -187,6 +238,7 @@ class TensorRTRunner:
         self.input_name, self.output_name = get_io_names(engine)
         self.input_dtype = torch_dtype_from_trt(engine.get_tensor_dtype(self.input_name))
         self.output_dtype = torch_dtype_from_trt(engine.get_tensor_dtype(self.output_name))
+        self.inference_stream = torch.cuda.Stream()
 
     def _configure_context(self, context: trt.IExecutionContext, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         engine_input_shape = tuple(self.engine.get_tensor_shape(self.input_name))
@@ -220,6 +272,7 @@ class TensorRTRunner:
                     stream=torch.cuda.Stream(),
                     done_event=torch.cuda.Event(blocking=False),
                     host_input=host_input,
+                    host_input_array=host_input.numpy(),
                     device_input=device_input,
                     device_output=device_output,
                     host_output=host_output,
@@ -228,18 +281,10 @@ class TensorRTRunner:
 
         return slots
     
-    def enqueue_async(self, slot: AsyncInferenceSlot, input_array: np.ndarray, frame_bgr: np.ndarray,) -> None:
+    def enqueue_async(self, slot: AsyncInferenceSlot, frame_bgr: np.ndarray) -> None:
         if slot.busy:
             raise RuntimeError("Tried to enqueue into a busy async inference slot.")
-        
-        input_shape = tuple(input_array.shape)
-        if input_shape != tuple(slot.host_input.shape):
-            raise ValueError(
-                f"Input shape {input_shape} does not match slot shape "
-                f"{tuple(slot.host_input.shape)}"
-            )
-        
-        slot.host_input.copy_(torch.from_numpy(input_array))
+
         slot.frame_bgr = frame_bgr
 
         with torch.cuda.stream(slot.stream):
@@ -275,22 +320,24 @@ class TensorRTRunner:
         return frame_bgr, logits
     
     def infer(self, input_array: np.ndarray) -> np.ndarray:
-        input_tensor = torch.from_numpy(input_array).to("cuda").to(self.input_dtype)
-        input_shape = tuple(input_tensor.shape)
-        output_shape = self._configure_context(self.context, input_shape)
+        with torch.cuda.stream(self.inference_stream):
+            input_tensor = torch.from_numpy(input_array).to("cuda").to(self.input_dtype)
+            input_shape = tuple(input_tensor.shape)
+            output_shape = self._configure_context(self.context, input_shape)
 
-        output_tensor = torch.empty(output_shape, dtype=self.output_dtype, device="cuda")
+            output_tensor = torch.empty(output_shape, dtype=self.output_dtype, device="cuda")
 
-        self.context.set_tensor_address(self.input_name, input_tensor.data_ptr())
-        self.context.set_tensor_address(self.output_name, output_tensor.data_ptr())
+            self.context.set_tensor_address(self.input_name, input_tensor.data_ptr())
+            self.context.set_tensor_address(self.output_name, output_tensor.data_ptr())
 
-        stream = torch.cuda.current_stream()
-        ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
-        if not ok:
-            raise RuntimeError("Failed to execute TensorRT engine.")
+            ok = self.context.execute_async_v3(
+                stream_handle=self.inference_stream.cuda_stream
+            )
+            if not ok:
+                raise RuntimeError("Failed to execute TensorRT engine.")
         
-        stream.synchronize()
-        return output_tensor.detach().cpu().float.numpy()
+        self.inference_stream.synchronize()
+        return output_tensor.detach().cpu().float().numpy()
 
 
 def postprocess(logits: np.ndarray, original_size: tuple[int, int]) -> np.ndarray:
@@ -388,8 +435,8 @@ def run_video(
             if slot.busy:
                 finish_and_write(slot)
 
-            input_array = preprocess_frame(frame, input_size)
-            runner.enqueue_async(slot, input_array, frame)
+            preprocess_frame(frame, input_size, output=slot.host_input_array)
+            runner.enqueue_async(slot, frame)
 
             scheduled_frames += 1
             next_slot_index = (next_slot_index + 1) % len(slots)
